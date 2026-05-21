@@ -119,8 +119,8 @@ jobs:
           NODE
           cat pnpm-workspace.yaml
 
-          - name: Install upstream deps
-      if: steps.check.outputs.needed == 'true'
+      - name: Install upstream deps
+        if: steps.check.outputs.needed == 'true'
         working-directory: Sub-Store/backend
         run: pnpm install --no-frozen-lockfile
 
