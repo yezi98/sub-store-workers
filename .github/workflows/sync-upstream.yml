@@ -139,6 +139,32 @@ jobs:
         working-directory: sub-store-workers
         run: npm run build
 
+      - name: Check worker bundle size
+        if: steps.check.outputs.needed == 'true'
+        id: size
+        working-directory: sub-store-workers
+        run: |
+          BYTES=$(stat -c %s dist/worker.js)
+          KB=$(awk "BEGIN {printf \"%.1f\", $BYTES/1024}")
+          MB=$(awk "BEGIN {printf \"%.2f\", $BYTES/1024/1024}")
+          GZIP_BYTES=$(gzip -c dist/worker.js | wc -c)
+          GZIP_KB=$(awk "BEGIN {printf \"%.1f\", $GZIP_BYTES/1024}")
+          echo "bytes=$BYTES" >> $GITHUB_OUTPUT
+          echo "kb=$KB" >> $GITHUB_OUTPUT
+          echo "mb=$MB" >> $GITHUB_OUTPUT
+          echo "gzip_kb=$GZIP_KB" >> $GITHUB_OUTPUT
+          echo "worker.js raw: ${KB} KB (${MB} MB), gzipped: ${GZIP_KB} KB"
+          # Workers 付费上限 10 MiB（gzipped），免费 3 MiB（gzipped）
+          HARD_LIMIT=$((10 * 1024 * 1024))
+          if [ "$GZIP_BYTES" -gt "$HARD_LIMIT" ]; then
+            echo "::error::Worker bundle gzipped size ${GZIP_KB} KB exceeds Cloudflare 10 MiB hard limit"
+            exit 1
+          fi
+          FREE_LIMIT=$((3 * 1024 * 1024))
+          if [ "$GZIP_BYTES" -gt "$FREE_LIMIT" ]; then
+            echo "::warning::Worker bundle gzipped size ${GZIP_KB} KB exceeds Cloudflare free tier 3 MiB limit (paid plan required)"
+          fi
+
       - name: Generate wrangler.toml
         if: steps.check.outputs.needed == 'true'
         working-directory: sub-store-workers
