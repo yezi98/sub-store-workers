@@ -39,12 +39,13 @@
 | `src/utils/env.js` | 环境检测变量，`backend = 'Workers'`，`isWorker = true` |
 | `src/restful/miscs.js` | 工具 API：`/api/utils/env`（暴露 `SUB_STORE_*` 给前端）、`/api/utils/worker-status`（KV/鉴权/能力诊断）、Gist 备份/还原、存储管理、刷新 |
 | `src/restful/token.js` | Token 签发/删除（Workers 版，替换上游 JWT 方案为 nanoid） |
+| `src/vendor/quickjs-executor.js` | **QuickJS 脚本沙箱**：替代上游 `new Function()` 执行用户脚本（Script Operator/Filter），支持 func / nodeFunc / content 三种模式，详见 4.4 |
 
 ### 3.2 构建层
 
 | 文件 | 职责 |
 |---|---|
-| `esbuild.js` | **构建脚本**：4 个 esbuild 插件桥接 Workers 与上游源码；同时把上游 `createDynamicFunction` 替换为明确不支持错误，避免运行时 `new Function` 失败 |
+| `esbuild.js` | **构建脚本**：4 个 esbuild 插件桥接 Workers 与上游源码；同时把上游 `createDynamicFunction` 替换为 QuickJS 沙箱执行（`SCRIPT_ENGINE=disabled` 可关闭） |
 | `wrangler.toml` | Workers 部署配置：KV 绑定、Cron、环境变量（路径密码推荐改用 Worker Secret） |
 | `package.json` | 依赖与脚本（`deploy`、`deploy:pages`、`rotate-secret`、`rotate-secret:sh`） |
 
@@ -118,6 +119,24 @@ esbuild.js
   └─ nodeStubPlugin: Node 模块 → Proxy 存根
 ```
 
+### 4.4 QuickJS 脚本执行（Script Operator/Filter）
+
+上游用 `new Function()` 动态执行用户脚本，Workers 禁止运行时代码生成，改用 QuickJS WASM 沙箱（`src/vendor/quickjs-executor.js`）。按输入类型分三种模式：
+
+```
+createScriptFunction(script, name)
+  ├─ func 模式：IIFE 包裹脚本 → 返回 function operator/filter → 调用
+  ├─ 失败且输入是节点数组 → nodeFunc 模式：快捷脚本逐 $server 遍历
+  └─ 失败且输入含 $content/$files（文件/覆写场景） → content 模式：
+       ├─ mihomoConfig/mihomoProfile 文件：沙箱内取脚本的 main 函数，
+       │    宿主侧 YAML 解析 $content → main(config) → YAML 序列化回 $content
+       │    （YAML 在宿主侧处理，因沙箱内无 ProxyUtils）
+       └─ 其他文件：注入 $content/$files 全局变量直接执行脚本，回读结果
+```
+
+> 背景：早期实现缺少 content 模式，$content 输入被当作节点数组遍历（对象无
+> length，循环不执行），导致 convert.js 类覆写脚本不报错但输出空配置。
+
 ## 5. 数据存储
 
 - **KV Key: `sub-store`** — 主缓存（订阅/组合/设置/tokens/artifacts）
@@ -131,7 +150,7 @@ esbuild.js
 - **未配置鉴权告警**：未配置时管理 API 访问会输出控制台警告并附加响应头 `X-Sub-Store-Security-Warning`，提醒部署者尽快设置密码。
 - **公开路径白名单**：`/api/download`、`/api/preview`、`/api/sub/flow` 不受鉴权限制
 - **CORS**：全局 `Access-Control-Allow-Origin: *`
-- **Script Operator 禁用**：构建期改写 `createDynamicFunction`，禁止 `eval`/`new Function` 形式的脚本操作，避免 Workers 平台拒绝执行。
+- **Script Operator 沙箱化**：构建期改写 `createDynamicFunction` 为 QuickJS WASM 沙箱执行（内存/栈/指令数限制），避免 `eval`/`new Function`；可用 `SCRIPT_ENGINE=disabled` 关闭。
 - **状态自检**：`/api/utils/worker-status` 输出 KV 绑定、鉴权、能力降级（脚本/socks/本地文件系统/cron）等运行时信息，方便部署后快速验证。
 
 ## 7. 外部依赖

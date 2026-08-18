@@ -114,7 +114,12 @@ const evalRewritePlugin = {
                 contents = contents.replace(
                     /function createDynamicFunction\(name, script, \$arguments, \$options\) \{[\s\S]*?\n\}/,
                     `function createDynamicFunction(name, script, $arguments, $options) {
-    throw new Error('Script Operator is not supported in Cloudflare Workers because dynamic code execution through eval/new Function is disabled. Use built-in filters/operators, mihomo YAML patch, or an external trusted execution service.');
+    const engine = globalThis.__workerEnv?.SCRIPT_ENGINE;
+    if (engine === 'disabled' || engine === 'none') {
+        throw new Error('Script Operator is disabled. Remove SCRIPT_ENGINE="disabled" from wrangler.toml [vars] to re-enable. Alternative: use built-in filters/operators, mihomo YAML patch, or an external trusted execution service.');
+    }
+    const { createScriptFunction } = require('@/vendor/quickjs-executor');
+    return createScriptFunction(script, name, $arguments, $options);
 }`,
                 );
             }
@@ -220,7 +225,6 @@ const nodeStubPlugin = {
             'fetch-socks',
             'child_process',
             'stream/promises',
-            'dns-packet',
             'mime-types',
             'jsrsasign',
             'fs',
@@ -231,6 +235,7 @@ const nodeStubPlugin = {
             'https',
             'os',
             'crypto',
+            'dgram',
         ];
 
         for (const mod of stubs) {
@@ -274,6 +279,10 @@ const nodeStubPlugin = {
         target: 'es2022',
         outfile: path.join(__dirname, 'dist', 'worker.js'),
         plugins: [aliasPlugin, peggyPrecompilePlugin, evalRewritePlugin, nodeStubPlugin],
+        loader: {
+            '.wasm': 'copy',
+        },
+        assetNames: '[name]',
         define: {
             'process.env.NODE_ENV': '"production"',
         },

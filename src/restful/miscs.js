@@ -179,8 +179,11 @@ function getWorkerStatus(req, res) {
                     },
                     capabilities: {
                         scriptOperator: {
-                            supported: false,
-                            reason: 'Cloudflare Workers does not allow dynamic code execution through eval/new Function.',
+                            supported: workerEnv.SCRIPT_ENGINE !== 'disabled' && workerEnv.SCRIPT_ENGINE !== 'none',
+                            engine: workerEnv.SCRIPT_ENGINE || 'quickjs',
+                            reason: (workerEnv.SCRIPT_ENGINE === 'disabled' || workerEnv.SCRIPT_ENGINE === 'none')
+                                ? 'Disabled via SCRIPT_ENGINE="disabled". Remove to re-enable QuickJS WASM sandbox.'
+                                : 'Enabled via QuickJS WASM sandbox (default). Set SCRIPT_ENGINE="disabled" to turn off.',
                             alternatives: [
                                 'Use built-in filters/operators',
                                 'Use mihomo YAML patch scripts',

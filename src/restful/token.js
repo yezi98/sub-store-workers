@@ -11,6 +11,7 @@ import {
 import { insertByPosition } from '@/utils/database';
 import { getCreateItemPosition } from '@/utils/create-item-position';
 import { archiveShare } from '@/utils/archive';
+import { normalizeAgePublicKeyConfig } from '@/utils/age';
 import ms from 'ms';
 import { customAlphabet, urlAlphabet } from 'nanoid';
 
@@ -85,7 +86,7 @@ function normalizeExpirationMode(mode) {
     if (mode == null || mode === '') {
         return undefined;
     }
-    if (mode === 'duration' || mode === 'datetime') {
+    if (mode === 'duration' || mode === 'datetime' || mode === 'count') {
         return mode;
     }
     throw new RequestInvalidError(
@@ -162,6 +163,38 @@ function resolveDurationExpiration(options = {}, { required = false } = {}) {
     };
 }
 
+function resolveCountExpiration(options = {}) {
+    const rawCount = options?.count;
+    if (rawCount == null || rawCount === '') {
+        throw new RequestInvalidError(
+            'INVALID_SHARE_COUNT',
+            `Invalid count option: ${rawCount}`,
+        );
+    }
+
+    const count = Number(rawCount);
+    if (!Number.isSafeInteger(count) || count <= 0) {
+        throw new RequestInvalidError(
+            'INVALID_SHARE_COUNT',
+            `Invalid count option: ${rawCount}`,
+        );
+    }
+
+    const rawUsedCount = options?.usedCount ?? 0;
+    const usedCount = Number(rawUsedCount);
+    if (!Number.isSafeInteger(usedCount) || usedCount < 0 || usedCount > count) {
+        throw new RequestInvalidError(
+            'INVALID_SHARE_USED_COUNT',
+            `Invalid usedCount option: ${rawUsedCount}`,
+        );
+    }
+
+    return {
+        count,
+        usedCount,
+    };
+}
+
 function createTokenItem(payload, options = {}) {
     const type = payload?.type;
     const name = payload?.name;
@@ -179,19 +212,18 @@ function createTokenItem(payload, options = {}) {
                 `Invalid custom token: ${token}`,
             );
         }
+        // Workers 幂等更新：KV cacheTtl 可能导致前端 DELETE+POST 读到旧数据
+        // 遇到重复 token 时先删除旧的，再创建新的（而非报错）
         const tokens = $.read(TOKENS_KEY) || [];
-        if (
-            tokens.find(
-                (item) =>
-                    item.token === token &&
-                    item.type === type &&
-                    item.name === name,
-            )
-        ) {
-            throw new RequestInvalidError(
-                'DUPLICATE_TOKEN',
-                `Token ${token} already exists`,
-            );
+        const existingIndex = tokens.findIndex(
+            (item) =>
+                item.token === token &&
+                item.type === type &&
+                item.name === name,
+        );
+        if (existingIndex >= 0) {
+            tokens.splice(existingIndex, 1);
+            $.write(tokens, TOKENS_KEY);
         }
     }
 
@@ -234,8 +266,11 @@ function createTokenItem(payload, options = {}) {
         inferLegacyExpirationMode(options);
     let durationExpiration = null;
     let exp;
+    let countExpiration = null;
     if (expirationMode === 'datetime') {
         exp = resolveExactExpiration(options);
+    } else if (expirationMode === 'count') {
+        countExpiration = resolveCountExpiration(options);
     } else {
         durationExpiration = resolveDurationExpiration(options, {
             required: expirationMode === 'duration',
@@ -259,6 +294,8 @@ function createTokenItem(payload, options = {}) {
     const normalizedMode =
         expirationMode === 'datetime'
             ? 'datetime'
+            : expirationMode === 'count'
+              ? 'count'
             : durationExpiration
               ? 'duration'
               : undefined;
@@ -266,6 +303,9 @@ function createTokenItem(payload, options = {}) {
     delete safePayload.mode;
     delete safePayload.exp;
     delete safePayload.expiresIn;
+    delete safePayload.count;
+    delete safePayload.usedCount;
+    normalizeAgePublicKeyConfig(safePayload);
     const tokenData = {
         ...safePayload,
         token,
@@ -273,6 +313,11 @@ function createTokenItem(payload, options = {}) {
         ...(normalizedMode ? { mode: normalizedMode } : {}),
         ...(normalizedMode === 'datetime'
             ? { exp }
+            : normalizedMode === 'count'
+              ? {
+                    count: countExpiration.count,
+                    usedCount: countExpiration.usedCount,
+                }
             : durationExpiration
               ? {
                     expiresIn: durationExpiration.rawExpiresIn,
@@ -304,6 +349,70 @@ function deleteTokenItem(token, type, name) {
     return match;
 }
 
+function matchesShareToken(item, { token, type, name, pathname }) {
+    return (
+        item.token === token &&
+        (type ? item.type === type : true) &&
+        (name ? item.name === name : true) &&
+        (pathname
+            ? `/share/${item.type}/${item.name}` === pathname ||
+              pathname.startsWith(`/share/${item.type}/${item.name}/`)
+            : true)
+    );
+}
+
+function isShareTokenUsable(item) {
+    if (item.exp != null && item.exp <= Date.now()) {
+        return false;
+    }
+
+    if (item.mode === 'count') {
+        const count = Number(item.count);
+        const usedCount = item.usedCount == null ? 0 : Number(item.usedCount);
+        return (
+            Number.isSafeInteger(count) &&
+            count > 0 &&
+            Number.isSafeInteger(usedCount) &&
+            usedCount >= 0 &&
+            usedCount < count
+        );
+    }
+
+    return true;
+}
+
+function consumeShareToken(query) {
+    const allTokens = $.read(TOKENS_KEY) || [];
+    const tokenIndex = allTokens.findIndex(
+        (item) => matchesShareToken(item, query) && isShareTokenUsable(item),
+    );
+    if (tokenIndex < 0) {
+        return null;
+    }
+
+    const token = allTokens[tokenIndex];
+    if (token.mode !== 'count') {
+        return token;
+    }
+
+    const nextToken = {
+        ...token,
+        usedCount: Number(token.usedCount ?? 0) + 1,
+    };
+    allTokens[tokenIndex] = nextToken;
+    $.write(allTokens, TOKENS_KEY);
+    return nextToken;
+}
+
+function findShareToken(query) {
+    const allTokens = $.read(TOKENS_KEY) || [];
+    return (
+        allTokens.find(
+            (item) => matchesShareToken(item, query) && isShareTokenUsable(item),
+        ) || null
+    );
+}
+
 function shouldArchiveDeletion(mode) {
     if (mode == null || mode === '' || mode === 'permanent') {
         return false;
@@ -317,4 +426,4 @@ function shouldArchiveDeletion(mode) {
     );
 }
 
-export { createTokenItem, deleteTokenItem };
+export { createTokenItem, deleteTokenItem, consumeShareToken, findShareToken };

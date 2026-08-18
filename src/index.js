@@ -23,10 +23,12 @@ import registerMiscRoutes from '@/restful/miscs';
 import registerNodeInfoRoutes from '@/restful/node-info';
 import registerParserRoutes from '@/restful/parser';
 import registerLogRoutes from '@/restful/logs';
+import registerAgeRoutes from '@/restful/age';
 
 import { produceArtifact } from '@/restful/sync';
 import { syncToGist } from '@/restful/artifacts';
 import { gistBackupAction } from '@/restful/miscs';
+import { consumeShareToken } from '@/restful/token';
 import { SETTINGS_KEY, ARTIFACTS_KEY, SUBS_KEY, COLLECTIONS_KEY } from '@/constants';
 import { findByName } from '@/utils/database';
 
@@ -49,6 +51,7 @@ registerNodeInfoRoutes($app);
 registerMiscRoutes($app);
 registerParserRoutes($app);
 registerLogRoutes($app);
+registerAgeRoutes($app);
 
 export default {
     // 定时同步
@@ -135,8 +138,56 @@ export default {
 
             console.log(`Sub-Store Workers v${version} handling: ${request.method} ${pathname}`);
 
+            // /share/ 路由的 token 验证（与上游 Node.js 版 be_merge 行为一致）
+            // 所有 /share/ 请求都必须携带有效 token，未分享的订阅/文件不可直接访问
+            if (pathname.startsWith('/share/')) {
+                if (request.method.toUpperCase() !== 'GET') {
+                    return new Response(JSON.stringify({ status: 'failed', message: 'Method not allowed' }), {
+                        status: 405,
+                        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
+                    });
+                }
+                const tokenValue = url.searchParams.get('token');
+                if (!tokenValue) {
+                    // 未提供 token，拒绝访问
+                    return new Response(JSON.stringify({ status: 'failed', message: 'Share token is required' }), {
+                        status: 403,
+                        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
+                    });
+                }
+                const decodedPathname = decodeURIComponent(pathname);
+                const shareToken = consumeShareToken({
+                    token: tokenValue,
+                    pathname: decodedPathname,
+                });
+                if (!shareToken) {
+                    // token 无效
+                    const settings = $.read(SETTINGS_KEY);
+                    if (settings?.appearanceSetting?.invalidShareFakeNode) {
+                        // 返回假节点
+                        const fakeUrl = new URL(request.url);
+                        fakeUrl.pathname = pathname.replace(/\/share\/.*?\//, '/share/sub/');
+                        fakeUrl.searchParams.set('_fakeNode', 'true');
+                        request = new Request(fakeUrl.toString(), request);
+                    } else {
+                        return new Response(JSON.stringify({ status: 'failed', message: 'Invalid or expired share token' }), {
+                            status: 404,
+                            headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
+                        });
+                    }
+                }
+                // token 有效，继续正常路由
+            }
+
             // 路由分发
             const response = await $app.handleRequest(request);
+
+            // 禁止 Cloudflare CDN/边缘节点缓存动态 API 响应
+            // 未设置此头时，不同 URL 路径（如 /share/ 和 /download/）的响应可能被独立缓存，
+            // 导致同一订阅在不同接口返回不一致（陈旧）的数据
+            response.headers.set('Cache-Control', 'no-store, no-cache, must-revalidate');
+            response.headers.set('CDN-Cache-Control', 'no-store');
+
             if (isAuthDisabledManagementApi) {
                 response.headers.set('X-Sub-Store-Security-Warning', 'SUB_STORE_FRONTEND_BACKEND_PATH is not configured; management API is public');
             }
