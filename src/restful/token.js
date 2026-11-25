@@ -1,5 +1,4 @@
 /** Workers 版 token 签发 */
-import { ENV } from '@/vendor/open-api';
 import { TOKENS_KEY, SUBS_KEY, FILES_KEY, COLLECTIONS_KEY } from '@/constants';
 import { failed, success } from '@/restful/response';
 import $ from '@/core/app';
@@ -14,6 +13,7 @@ import { archiveShare } from '@/utils/archive';
 import { normalizeAgePublicKeyConfig } from '@/utils/age';
 import ms from 'ms';
 import { customAlphabet, urlAlphabet } from 'nanoid';
+import { nanoid as nonSecureNanoid } from 'nanoid/non-secure';
 
 export default function register($app) {
     if (!$.read(TOKENS_KEY)) $.write([], TOKENS_KEY);
@@ -23,6 +23,14 @@ export default function register($app) {
     $app.route('/api/token/:token').delete(deleteToken);
 
     $app.route('/api/tokens').get(getAllTokens);
+}
+
+function generateShareToken() {
+    try {
+        return customAlphabet(urlAlphabet)();
+    } catch {
+        return nonSecureNanoid();
+    }
 }
 
 function deleteToken(req, res) {
@@ -127,6 +135,8 @@ function resolveExactExpiration(options = {}) {
     if (
         !Number.isSafeInteger(exp) ||
         exp <= 0 ||
+        // Require an explicit millisecond Unix timestamp to avoid
+        // silently accepting second-based values from non-frontend callers.
         exp < 1000000000000
     ) {
         throw new RequestInvalidError(
@@ -159,7 +169,84 @@ function resolveDurationExpiration(options = {}, { required = false } = {}) {
 
     return {
         rawExpiresIn,
+        expiresIn,
         exp: Date.now() + expiresIn,
+    };
+}
+
+const DURATION_INPUT_UNIT_MS = {
+    day: 24 * 60 * 60 * 1000,
+    month: 30 * 24 * 60 * 60 * 1000,
+    season: 90 * 24 * 60 * 60 * 1000,
+    year: 365 * 24 * 60 * 60 * 1000,
+};
+
+// 长期有效: 不设置 exp, 直到分享被删除前始终有效
+const LIFETIME_DURATION_UNIT = 'lifetime';
+
+function isLifetimeDuration(options = {}) {
+    const rawExpiresUnit = options?.expiresUnit;
+    return (
+        typeof rawExpiresUnit === 'string' &&
+        rawExpiresUnit.trim() === LIFETIME_DURATION_UNIT
+    );
+}
+
+function resolveLifetimeDuration(options = {}) {
+    const rawExpiresIn = options?.expiresIn;
+    if (rawExpiresIn != null && rawExpiresIn !== '') {
+        throw new RequestInvalidError(
+            'INVALID_DURATION_INPUT',
+            `expiresIn option is not allowed for lifetime duration: ${rawExpiresIn}`,
+        );
+    }
+    return {
+        expiresUnit: LIFETIME_DURATION_UNIT,
+    };
+}
+
+function resolveDurationInput(options = {}, durationExpiration) {
+    const rawExpiresValue = options?.expiresValue;
+    const rawExpiresUnit = options?.expiresUnit;
+    const hasExpiresValue = rawExpiresValue != null && rawExpiresValue !== '';
+    const hasExpiresUnit = rawExpiresUnit != null && rawExpiresUnit !== '';
+    if (!hasExpiresValue && !hasExpiresUnit) {
+        return null;
+    }
+
+    const expiresValue = Number(rawExpiresValue);
+    if (!Number.isFinite(expiresValue) || expiresValue <= 0) {
+        throw new RequestInvalidError(
+            'INVALID_EXPIRES_VALUE',
+            `Invalid expiresValue option: ${rawExpiresValue}`,
+        );
+    }
+
+    const expiresUnit =
+        typeof rawExpiresUnit === 'string' ? rawExpiresUnit.trim() : '';
+    if (!['day', 'month', 'season', 'year'].includes(expiresUnit)) {
+        throw new RequestInvalidError(
+            'INVALID_EXPIRES_UNIT',
+            `Invalid expiresUnit option: ${rawExpiresUnit}`,
+        );
+    }
+
+    const normalizedExpiresValue = Number(expiresValue.toFixed(2));
+    const expectedExpiresIn =
+        normalizedExpiresValue * DURATION_INPUT_UNIT_MS[expiresUnit];
+    if (
+        durationExpiration &&
+        Math.abs(durationExpiration.expiresIn - expectedExpiresIn) > 1
+    ) {
+        throw new RequestInvalidError(
+            'INVALID_DURATION_INPUT',
+            `expiresValue/expiresUnit do not match expiresIn option: ${rawExpiresValue}${expiresUnit} != ${options?.expiresIn}`,
+        );
+    }
+
+    return {
+        expiresValue: String(normalizedExpiresValue),
+        expiresUnit,
     };
 }
 
@@ -265,23 +352,30 @@ function createTokenItem(payload, options = {}) {
         normalizeExpirationMode(options?.mode) ??
         inferLegacyExpirationMode(options);
     let durationExpiration = null;
+    let durationInput = null;
+    let lifetimeDuration = null;
     let exp;
     let countExpiration = null;
     if (expirationMode === 'datetime') {
         exp = resolveExactExpiration(options);
     } else if (expirationMode === 'count') {
         countExpiration = resolveCountExpiration(options);
+    } else if (expirationMode === 'duration' && isLifetimeDuration(options)) {
+        lifetimeDuration = resolveLifetimeDuration(options);
     } else {
         durationExpiration = resolveDurationExpiration(options, {
             required: expirationMode === 'duration',
         });
+        if (durationExpiration) {
+            durationInput = resolveDurationInput(options, durationExpiration);
+        }
         exp = durationExpiration?.exp;
     }
 
     const tokens = $.read(TOKENS_KEY) || [];
     if (!token) {
         do {
-            token = customAlphabet(urlAlphabet)();
+            token = generateShareToken();
         } while (
             tokens.find(
                 (item) =>
@@ -296,13 +390,15 @@ function createTokenItem(payload, options = {}) {
             ? 'datetime'
             : expirationMode === 'count'
               ? 'count'
-            : durationExpiration
+            : durationExpiration || lifetimeDuration
               ? 'duration'
               : undefined;
     const safePayload = { ...payload };
     delete safePayload.mode;
     delete safePayload.exp;
     delete safePayload.expiresIn;
+    delete safePayload.expiresValue;
+    delete safePayload.expiresUnit;
     delete safePayload.count;
     delete safePayload.usedCount;
     normalizeAgePublicKeyConfig(safePayload);
@@ -318,9 +414,12 @@ function createTokenItem(payload, options = {}) {
                     count: countExpiration.count,
                     usedCount: countExpiration.usedCount,
                 }
+            : lifetimeDuration
+              ? { ...lifetimeDuration }
             : durationExpiration
               ? {
                     expiresIn: durationExpiration.rawExpiresIn,
+                    ...(durationInput || {}),
                     exp,
                 }
               : {}),
@@ -404,6 +503,28 @@ function consumeShareToken(query) {
     return nextToken;
 }
 
+function consumeShareTokenForRequest(req, type) {
+    const query = {
+        token: req.query?.token,
+        type,
+        name: req.params?.name,
+    };
+    if (
+        req.subStoreShareToken &&
+        req.subStoreShareToken.token === query.token &&
+        req.subStoreShareToken.type === type &&
+        req.subStoreShareToken.name === query.name
+    ) {
+        return req.subStoreShareToken;
+    }
+
+    const token = consumeShareToken(query);
+    if (token) {
+        req.subStoreShareToken = token;
+    }
+    return token;
+}
+
 function findShareToken(query) {
     const allTokens = $.read(TOKENS_KEY) || [];
     return (
@@ -426,4 +547,10 @@ function shouldArchiveDeletion(mode) {
     );
 }
 
-export { createTokenItem, deleteTokenItem, consumeShareToken, findShareToken };
+export {
+    createTokenItem,
+    deleteTokenItem,
+    consumeShareToken,
+    consumeShareTokenForRequest,
+    findShareToken,
+};
